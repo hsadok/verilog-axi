@@ -118,6 +118,9 @@ reg [1:0] write_state_reg = WRITE_STATE_IDLE, write_state_next;
 reg mem_wr_en;
 reg mem_rd_en;
 
+reg use_aw_addr;
+reg use_ar_addr;
+
 reg [ID_WIDTH-1:0] read_id_reg = {ID_WIDTH{1'b0}}, read_id_next;
 reg [ADDR_WIDTH-1:0] read_addr_reg = {ADDR_WIDTH{1'b0}}, read_addr_next;
 reg [7:0] read_count_reg = 8'd0, read_count_next;
@@ -179,6 +182,7 @@ always @* begin
     write_state_next = WRITE_STATE_IDLE;
 
     mem_wr_en = 1'b0;
+    use_aw_addr = 1'b0;
 
     write_id_next = write_id_reg;
     write_addr_next = write_addr_reg;
@@ -194,6 +198,7 @@ always @* begin
     case (write_state_reg)
         WRITE_STATE_IDLE: begin
             s_axi_awready_next = 1'b1;
+            s_axi_wready_next = 1'b1;
 
             if (s_axi_awready && s_axi_awvalid) begin
                 write_id_next = s_axi_awid;
@@ -204,7 +209,32 @@ always @* begin
 
                 s_axi_awready_next = 1'b0;
                 s_axi_wready_next = 1'b1;
-                write_state_next = WRITE_STATE_BURST;
+
+                if (s_axi_wready && s_axi_wvalid) begin
+                    // accept AW and first W beat simultaneously
+                    mem_wr_en = 1'b1;
+                    use_aw_addr = 1'b1;
+                    if (s_axi_awburst != 2'b00) begin
+                        write_addr_next = s_axi_awaddr + (1 << (s_axi_awsize < $clog2(STRB_WIDTH) ? s_axi_awsize : $clog2(STRB_WIDTH)));
+                    end
+                    if (s_axi_awlen > 0) begin
+                        write_count_next = s_axi_awlen - 1;
+                        write_state_next = WRITE_STATE_BURST;
+                    end else begin
+                        s_axi_wready_next = 1'b0;
+                        if (s_axi_bready || !s_axi_bvalid) begin
+                            s_axi_bid_next = s_axi_awid;
+                            s_axi_bvalid_next = 1'b1;
+                            s_axi_awready_next = 1'b1;
+                            s_axi_wready_next = 1'b1;
+                            write_state_next = WRITE_STATE_IDLE;
+                        end else begin
+                            write_state_next = WRITE_STATE_RESP;
+                        end
+                    end
+                end else begin
+                    write_state_next = WRITE_STATE_BURST;
+                end
             end else begin
                 write_state_next = WRITE_STATE_IDLE;
             end
@@ -221,13 +251,14 @@ always @* begin
                 if (write_count_reg > 0) begin
                     write_state_next = WRITE_STATE_BURST;
                 end else begin
-                    s_axi_wready_next = 1'b0;
                     if (s_axi_bready || !s_axi_bvalid) begin
                         s_axi_bid_next = write_id_reg;
                         s_axi_bvalid_next = 1'b1;
                         s_axi_awready_next = 1'b1;
+                        s_axi_wready_next = 1'b1;
                         write_state_next = WRITE_STATE_IDLE;
                     end else begin
+                        s_axi_wready_next = 1'b0;
                         write_state_next = WRITE_STATE_RESP;
                     end
                 end
@@ -240,6 +271,7 @@ always @* begin
                 s_axi_bid_next = write_id_reg;
                 s_axi_bvalid_next = 1'b1;
                 s_axi_awready_next = 1'b1;
+                s_axi_wready_next = 1'b1;
                 write_state_next = WRITE_STATE_IDLE;
             end else begin
                 write_state_next = WRITE_STATE_RESP;
@@ -264,7 +296,7 @@ always @(posedge clk) begin
 
     for (i = 0; i < WORD_WIDTH; i = i + 1) begin
         if (mem_wr_en & s_axi_wstrb[i]) begin
-            mem[write_addr_valid][WORD_SIZE*i +: WORD_SIZE] <= s_axi_wdata[WORD_SIZE*i +: WORD_SIZE];
+            mem[use_aw_addr ? s_axi_awaddr_valid : write_addr_valid][WORD_SIZE*i +: WORD_SIZE] <= s_axi_wdata[WORD_SIZE*i +: WORD_SIZE];
         end
     end
 
@@ -281,6 +313,7 @@ always @* begin
     read_state_next = READ_STATE_IDLE;
 
     mem_rd_en = 1'b0;
+    use_ar_addr = 1'b0;
 
     s_axi_rid_next = s_axi_rid_reg;
     s_axi_rlast_next = s_axi_rlast_reg;
@@ -305,8 +338,31 @@ always @* begin
                 read_size_next = s_axi_arsize < $clog2(STRB_WIDTH) ? s_axi_arsize : $clog2(STRB_WIDTH);
                 read_burst_next = s_axi_arburst;
 
-                s_axi_arready_next = 1'b0;
-                read_state_next = READ_STATE_BURST;
+                if (s_axi_rready || (PIPELINE_OUTPUT && !s_axi_rvalid_pipe_reg) || !s_axi_rvalid_reg) begin
+                    // output register available: start first read immediately
+                    mem_rd_en = 1'b1;
+                    use_ar_addr = 1'b1;
+                    s_axi_rvalid_next = 1'b1;
+                    s_axi_rid_next = s_axi_arid;
+                    s_axi_rlast_next = s_axi_arlen == 0;
+
+                    if (s_axi_arlen > 0) begin
+                        if (s_axi_arburst != 2'b00) begin
+                            read_addr_next = s_axi_araddr + (1 << (s_axi_arsize < $clog2(STRB_WIDTH) ? s_axi_arsize : $clog2(STRB_WIDTH)));
+                        end
+                        read_count_next = s_axi_arlen - 1;
+                        s_axi_arready_next = 1'b0;
+                        read_state_next = READ_STATE_BURST;
+                    end else begin
+                        // single-beat burst complete, stay in IDLE
+                        s_axi_arready_next = 1'b1;
+                        read_state_next = READ_STATE_IDLE;
+                    end
+                end else begin
+                    // output busy: defer to BURST state
+                    s_axi_arready_next = 1'b0;
+                    read_state_next = READ_STATE_BURST;
+                end
             end else begin
                 read_state_next = READ_STATE_IDLE;
             end
@@ -349,7 +405,7 @@ always @(posedge clk) begin
     s_axi_rvalid_reg <= s_axi_rvalid_next;
 
     if (mem_rd_en) begin
-        s_axi_rdata_reg <= mem[read_addr_valid];
+        s_axi_rdata_reg <= mem[use_ar_addr ? s_axi_araddr_valid : read_addr_valid];
     end
 
     if (!s_axi_rvalid_pipe_reg || s_axi_rready) begin
